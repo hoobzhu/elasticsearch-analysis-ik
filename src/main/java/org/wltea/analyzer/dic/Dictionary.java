@@ -38,11 +38,14 @@ import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
+import java.sql.*;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.commons.lang3.concurrent.BasicThreadFactory;
 import org.apache.http.Header;
 import org.apache.http.HttpEntity;
 import org.apache.http.client.ClientProtocolException;
@@ -80,7 +83,7 @@ public class Dictionary {
 	 */
 	private Configuration configuration;
 
-	private static final Logger logger = ESPluginLoggerFactory.getLogger(Dictionary.class.getName());
+	private static final Logger logger = ESPluginLoggerFactory.getLogger(Monitor.class.getName());
 
 	private static ScheduledExecutorService pool = Executors.newScheduledThreadPool(1);
 
@@ -99,7 +102,16 @@ public class Dictionary {
 
 	private Path conf_dir;
 	private Properties props;
+	private static ScheduledThreadPoolExecutor loadDictTimer = new ScheduledThreadPoolExecutor(1,new BasicThreadFactory.Builder().namingPattern("overloadTimer-schedule-pool-%d").daemon(true).build());//配置定时器
+	private static Properties prop = new Properties();
 
+	static {
+		try {
+			Class.forName("com.mysql.jdbc.Driver");
+		} catch (ClassNotFoundException e) {
+			logger.error(e.getMessage(), e);
+		}
+	}
 	private Dictionary(Configuration cfg) {
 		this.configuration = cfg;
 		this.props = new Properties();
@@ -154,7 +166,13 @@ public class Dictionary {
 					singleton.loadSuffixDict();
 					singleton.loadPrepDict();
 					singleton.loadStopWordDict();
-
+                    //周期性自动重新加载配置    30*6重新加載一次
+					loadDictTimer.scheduleAtFixedRate(new Runnable() {
+						@Override
+						public void run() {
+							Dictionary.getSingleton().reLoadMainDict();
+						}
+					},5,60*30, TimeUnit.SECONDS);
 					if(cfg.isEnableRemoteDict()){
 						// 建立监控线程
 						for (String location : singleton.getRemoteExtDictionarys()) {
@@ -294,7 +312,7 @@ public class Dictionary {
 	 */
 	public static Dictionary getSingleton() {
 		if (singleton == null) {
-			throw new IllegalStateException("ik dict has not been initialized yet, please call initial method first.");
+			throw new IllegalStateException("词典尚未初始化，请先调用initial方法");
 		}
 		return singleton;
 	}
@@ -391,6 +409,8 @@ public class Dictionary {
 		this.loadExtDict();
 		// 加载远程自定义词库
 		this.loadRemoteExtDict();
+		// 从mysql加载词典
+		this.loadMySQLExtDict();
 	}
 
 	/**
@@ -419,7 +439,7 @@ public class Dictionary {
 			List<String> lists = getRemoteWords(location);
 			// 如果找不到扩展的字典，则忽略
 			if (lists == null) {
-				logger.error("[Dict Loading] " + location + " load failed");
+				logger.error("[Dict Loading] " + location + "加载失败");
 				continue;
 			}
 			for (String theWord : lists) {
@@ -469,7 +489,7 @@ public class Dictionary {
 						}
 					}
 
-					if (entity.getContentLength() > 0 || entity.isChunked()) {
+					if (entity.getContentLength() > 0) {
 						in = new BufferedReader(new InputStreamReader(entity.getContent(), charset));
 						String line;
 						while ((line = in.readLine()) != null) {
@@ -518,7 +538,7 @@ public class Dictionary {
 			List<String> lists = getRemoteWords(location);
 			// 如果找不到扩展的字典，则忽略
 			if (lists == null) {
-				logger.error("[Dict Loading] " + location + " load failed");
+				logger.error("[Dict Loading] " + location + "加载失败");
 				continue;
 			}
 			for (String theWord : lists) {
@@ -529,7 +549,8 @@ public class Dictionary {
 				}
 			}
 		}
-
+		//加载mysql停用词
+		this.loadMySQLStopwordDict();
 	}
 
 	/**
@@ -562,7 +583,7 @@ public class Dictionary {
 	}
 
 	void reLoadMainDict() {
-		logger.info("start to reload ik dict.");
+		logger.info("重新加载词典...");
 		// 新开一个实例加载词典，减少加载过程对当前词典使用的影响
 		Dictionary tmpDict = new Dictionary(configuration);
 		tmpDict.configuration = getSingleton().configuration;
@@ -570,7 +591,113 @@ public class Dictionary {
 		tmpDict.loadStopWordDict();
 		_MainDict = tmpDict._MainDict;
 		_StopWords = tmpDict._StopWords;
-		logger.info("reload ik dict finished.");
+		logger.info("重新加载词典完毕...");
+	}
+
+	/**
+	 * 从mysql加载热更新词典
+	 */
+	private void loadMySQLExtDict() {
+		Connection conn = null;
+		Statement stmt = null;
+		ResultSet rs = null;
+		try {
+			Path file = PathUtils.get(getDictRoot(), "jdbc-reload.properties");
+			prop.load(new FileInputStream(file.toFile()));
+
+			logger.info("query hot dict from mysql, " + prop.getProperty("jdbc.reload.hostWord.sql") + "......");
+
+			conn = DriverManager.getConnection(
+					prop.getProperty("jdbc.url"),
+					prop.getProperty("jdbc.user"),
+					prop.getProperty("jdbc.password"));
+			stmt = conn.createStatement();
+			rs = stmt.executeQuery(prop.getProperty("jdbc.reload.hostWord.sql"));
+
+			while(rs.next()) {
+				String theWord = rs.getString("word");
+				_MainDict.fillSegment(theWord.trim().toCharArray());
+			}
+
+			//Thread.sleep(Integer.valueOf(String.valueOf(prop.get("jdbc.reload.interval"))));
+		} catch (Exception e) {
+			logger.error(e.getMessage(), e);
+		} finally {
+			if(rs != null) {
+				try {
+					rs.close();
+				} catch (SQLException e) {
+					logger.error(e.getMessage(), e);
+				}
+			}
+			if(stmt != null) {
+				try {
+					stmt.close();
+				} catch (SQLException e) {
+					logger.error(e.getMessage(), e);
+				}
+			}
+			if(conn != null) {
+				try {
+					conn.close();
+				} catch (SQLException e) {
+					logger.error(e.getMessage(), e);
+				}
+			}
+		}
+	}
+
+	/**
+	 * 从mysql加载停用词
+	 */
+	private void loadMySQLStopwordDict() {
+		Connection conn = null;
+		Statement stmt = null;
+		ResultSet rs = null;
+		try {
+			Path file = PathUtils.get(getDictRoot(), "jdbc-reload.properties");
+			prop.load(new FileInputStream(file.toFile()));
+
+
+			logger.info("query hot stopWord dict from mysql, " + prop.getProperty("jdbc.reload.stopWord.sql") + "......");
+
+			conn = DriverManager.getConnection(
+					prop.getProperty("jdbc.url"),
+					prop.getProperty("jdbc.user"),
+					prop.getProperty("jdbc.password"));
+			stmt = conn.createStatement();
+			rs = stmt.executeQuery(prop.getProperty("jdbc.reload.stopWord.sql"));
+
+			while(rs.next()) {
+				String theWord = rs.getString("word");
+				_StopWords.fillSegment(theWord.trim().toCharArray());
+			}
+		} catch (Exception e) {
+			logger.error(e.getMessage(), e);
+		} finally {
+			if(rs != null) {
+				try {
+					rs.close();
+				} catch (SQLException e) {
+					logger.error(e.getMessage(), e);
+				}
+			}
+			if(stmt != null) {
+				try {
+					stmt.close();
+				} catch (SQLException e) {
+					logger.error(e.getMessage(), e);
+				}
+			}
+			if(conn != null) {
+				try {
+					conn.close();
+				} catch (SQLException e) {
+					logger.error(e.getMessage(), e);
+				}
+			}
+		}
 	}
 
 }
+
